@@ -2,10 +2,10 @@
 # -*- coding: utf-8 -*-
 
 """
-改动摘要（相对你的原版）：
-- 【重要】extract_code() 只在附近窗口或主题命中验证码关键词时才返回；不再回退到“随便取一段数字”
-- 统一 OTP_MIN/OTP_MAX 与 CODE_RE；避免 4 位/URL 参数误判
-- URL/邮箱附近的数字继续过滤，窗口放宽，减少长 URL 参数误判
+改动要点：
+- OTP_MIN/OTP_MAX 固定 6 位
+- WINDOW_NEAR 扩大到 180
+- extract_code() 加入“宽松模式”兜底（RELAXED_OTP=1 时，转发任意 6 位数字，仍规避 URL/邮箱）
 """
 
 import os, re, time, ssl, poplib, email, requests, hashlib
@@ -19,11 +19,11 @@ from datetime import datetime
 FETCH_STARTUP_LAST_N = 2     # 启动时最多读取 N 条历史验证码（仅一次）
 POLL_SECONDS = 1             # 轮询间隔（秒）
 RECONNECT_EVERY = 10         # 每隔 X 秒强制重连（更快看到新邮件）
-OTP_MIN, OTP_MAX = 5, 8      # 验证码长度范围（要固定 6 位可改成 OTP_MIN=OTP_MAX=6）
-WINDOW_NEAR = 100            # 关键字近邻窗口（字符）
+OTP_MIN, OTP_MAX = 5, 8      # 验证码长度范围（固定 6 位）
+WINDOW_NEAR = 180            # 关键字近邻窗口（字符）
 
 # Telegram 发送优化
-PER_CHAT_GAP = 0.8           # 同一 chat 两条消息的最小间隔
+PER_CHAT_GAP = 0.8
 TG_CONNECT_TIMEOUT = 3
 TG_READ_TIMEOUT = 5
 TG_RETRIES = 2
@@ -33,7 +33,9 @@ NEAR_KEYS = [
     "验证码","校验码","确认码","动态码","一次性","短信码","安全码","登录码",
     "登录","验证","认证","绑定","注册","激活","重置","找回","支付","提现","取款",
     "otp","2fa","code","passcode","security code","verification code",
-    "verify","verification","login","sign-in","signin","one-time code","two-factor"
+    "verify","verification","login","sign-in","signin","one-time code","two-factor",
+    # 新增一些常见提示词
+    "authentication","auth code","确认登录","安全验证","动态密码","一次性密码","登录确认","登录验证"
 ]
 
 # 统一长度（与 OTP_MIN/OTP_MAX 一致）；允许中间空格/横杠
@@ -53,6 +55,12 @@ _adapter = HTTPAdapter(
 )
 TG_SESSION.mount("https://", _adapter)
 TG_SESSION.mount("http://", _adapter)
+
+DEBUG = os.getenv("DEBUG", "0") == "1"
+
+def dprint(*args):
+    if DEBUG:
+        print(*args, flush=True)
 
 def dec(s):
     if not s: return ""
@@ -118,22 +126,22 @@ def send_tg(token, chat_id, text, proxy=None):
                             timeout=(TG_CONNECT_TIMEOUT, TG_READ_TIMEOUT),
                             proxies=proxies)
     except Exception as e:
-        print("Telegram 推送失败：", e)
+        print("Telegram 推送失败：", e, flush=True)
 
 def connect_pop3(host, user, pwd, port_ssl=995, port_plain=110):
     try:
         ctx = ssl.create_default_context()
         srv = poplib.POP3_SSL(host, port_ssl, context=ctx, timeout=10)
         srv.user(user); srv.pass_(pwd)
-        print("[POP3] 995/SSL")
+        print("[POP3] 995/SSL", flush=True)
         return srv
     except Exception as e:
-        print("[POP3] 995 失败，用 110+STLS/PLAIN：", e)
+        print("[POP3] 995 失败，用 110+STLS/PLAIN：", e, flush=True)
         srv = poplib.POP3(host, port_plain, timeout=10)
         try:
-            srv.stls(); print("[POP3] 110 已升级 STLS")
+            srv.stls(); print("[POP3] 110 已升级 STLS", flush=True)
         except Exception:
-            print("[POP3] 110 明文（仅在可信网络用）")
+            print("[POP3] 110 明文（仅在可信网络用）", flush=True)
         srv.user(user); srv.pass_(pwd)
         return srv
 
@@ -181,7 +189,7 @@ def _in_url_or_email(hay: str, s: int, e: int) -> bool:
 def extract_code(text: str, subject: str = ""):
     """
     仅在“附近窗口命中关键词”或“主题命中关键词”时返回验证码；
-    否则返回 None —— 避免营销邮件/长 URL 参数等误报。
+    若未命中且开启 RELAXED_OTP=1，则宽松匹配任意 6 位数字（避开 URL/邮箱）。
     """
     hay = ((subject or "") + "\n" + (text or ""))
     candidates = []
@@ -200,18 +208,24 @@ def extract_code(text: str, subject: str = ""):
 
         # 只有命中关键词才纳入候选
         if near_hit or subj_hit:
-            # score: 0=附近命中，1=仅主题命中
-            score = 0 if near_hit else 1
+            score = 0 if near_hit else 1  # 0=附近命中，1=仅主题命中
             candidates.append((score, s, digits))
 
     if not candidates:
+        # 宽松模式兜底
+        if os.getenv("RELAXED_OTP", "0") == "1":
+            m2 = re.search(r"(?<!\d)\d{6}(?!\d)", hay)
+            if m2:
+                s2, e2 = m2.span()
+                if not _in_url_or_email(hay, s2, e2):
+                    dprint("[RELAXED] 命中 6 位数字")
+                    return m2.group()
         return None
 
     candidates.sort(key=lambda x: (x[0], x[1]))  # 附近命中优先；相同按出现顺序
     return candidates[0][2]
 
 def startup_flag_path(user):
-    import hashlib
     key = hashlib.sha1(user.encode("utf-8")).hexdigest()[:12]
     return os.path.join(os.getcwd(), f".startup_done_{key}.flag")
 
@@ -256,7 +270,7 @@ def run_session(host, user, pwd, token, chat, proxy, seen_uids):
                         except Exception: pass
                     seen_uids.add(uid)
                 except Exception as e:
-                    print("历史邮件处理失败：", e)
+                    print("历史邮件处理失败：", e, flush=True)
         else:
             flag = startup_flag_path(user)
             if not os.path.exists(flag):
@@ -273,7 +287,7 @@ def run_session(host, user, pwd, token, chat, proxy, seen_uids):
                             try: open("latest_code.txt","w",encoding="utf-8").write(code)
                             except Exception: pass
                     except Exception as e:
-                        print("历史邮件处理失败：", e)
+                        print("历史邮件处理失败：", e, flush=True)
                 try: open(flag, "w").write("done")
                 except Exception: pass
             baseline_total = total
@@ -334,9 +348,9 @@ def run_session(host, user, pwd, token, chat, proxy, seen_uids):
             time.sleep(POLL_SECONDS)
 
         except poplib.error_proto as e:
-            print("[POP3] 会话异常，切换到重连…", e); break
+            print("[POP3] 会话异常，切换到重连…", e, flush=True); break
         except Exception as e:
-            print("错误：", e); time.sleep(POLL_SECONDS)
+            print("错误：", e, flush=True); time.sleep(POLL_SECONDS)
     # ================================================
 
     try: srv.quit()
@@ -348,7 +362,7 @@ def main():
     except Exception:
         pass
 
-    host  = os.getenv("POP3_HOST","pop3.2925.com").strip()
+    host  = os.getenv("POP3_HOST","pop.2925.com").strip()
     user  = os.getenv("EMAIL_USER","")
     pwd   = os.getenv("EMAIL_PASS","")
     token = os.getenv("TELEGRAM_BOT_TOKEN","")
@@ -356,18 +370,18 @@ def main():
     proxy = os.getenv("TG_PROXY") or None
 
     try:
-        send_tg(token, chat, "✅ POP3 验证码监听已启动。（更严格关键词判定；先发“时间+发件人”，再发“验证码”）", proxy)
+        send_tg(token, chat, "✅ POP3 验证码监听已启动。（宽松模式可用：RELAXED_OTP=1）", proxy)
     except Exception as e:
-        print("❌ Telegram 失败：", e)
+        print("❌ Telegram 失败：", e, flush=True)
 
     seen_uids = set()
     while True:
         try:
             run_session(host, user, pwd, token, chat, proxy, seen_uids)
         except KeyboardInterrupt:
-            print("\n已退出。"); break
+            print("\n已退出。", flush=True); break
         except Exception as e:
-            print("重连失败：", e)
+            print("重连失败：", e, flush=True)
         time.sleep(1)
 
 if __name__ == "__main__":

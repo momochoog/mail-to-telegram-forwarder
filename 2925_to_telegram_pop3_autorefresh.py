@@ -1,89 +1,76 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-改动摘要（相对你的原版）：
-- 【重要】extract_code() 只在附近窗口或主题命中验证码关键词时才返回；不再回退到“随便取一段数字”
-- 统一 OTP_MIN/OTP_MAX 与 CODE_RE；避免 4 位/URL 参数误判
-- URL/邮箱附近的数字继续过滤，窗口放宽，减少长 URL 参数误判
-"""
-
 import os, re, time, ssl, poplib, email, requests, hashlib
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 from email.header import decode_header, make_header
-from email.utils import parsedate_to_datetime, parseaddr
+from email.utils import parsedate_to_datetime
 from datetime import datetime
 
-# ====== 可调参数 ======
-FETCH_STARTUP_LAST_N = 2     # 启动时最多读取 N 条历史验证码（仅一次）
-POLL_SECONDS = 1             # 轮询间隔（秒）
-RECONNECT_EVERY = 10         # 每隔 X 秒强制重连（更快看到新邮件）
-OTP_MIN, OTP_MAX = 5, 8      # 验证码长度范围（要固定 6 位可改成 OTP_MIN=OTP_MAX=6）
-WINDOW_NEAR = 100            # 关键字近邻窗口（字符）
+# 尝试最早加载 .env，使下方的 os.getenv 能读取到
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
-# Telegram 发送优化
-PER_CHAT_GAP = 0.8           # 同一 chat 两条消息的最小间隔
-TG_CONNECT_TIMEOUT = 3
-TG_READ_TIMEOUT = 5
-TG_RETRIES = 2
-# =====================
+# ===================== 可调参数（均可用环境变量覆盖） =====================
+FETCH_STARTUP_LAST_N = int(os.getenv("FETCH_STARTUP_LAST_N", "2"))   # 启动最多补扫 N 封（仅一次）
+POLL_SECONDS         = float(os.getenv("POLL_SECONDS", "2"))         # 轮询间隔（秒）
+RECONNECT_EVERY      = float(os.getenv("RECONNECT_EVERY", "10"))     # 每隔 N 秒强制重连
 
-NEAR_KEYS = [
-    "验证码","校验码","确认码","动态码","一次性","短信码","安全码","登录码",
-    "登录","验证","认证","绑定","注册","激活","重置","找回","支付","提现","取款",
-    "otp","2fa","code","passcode","security code","verification code",
-    "verify","verification","login","sign-in","signin","one-time code","two-factor"
-]
+# 识别相关
+OTP_MIN, OTP_MAX     = int(os.getenv("OTP_MIN", "4")), int(os.getenv("OTP_MAX", "8"))
+WINDOW_NEAR          = int(os.getenv("WINDOW_NEAR", "300"))          # 近邻窗口（前后各这么多字符）
+ALLOW_CODE_IN_URL    = os.getenv("ALLOW_CODE_IN_URL", "0") == "1"    # 允许链接/邮箱里的数字
+LOOSE_MODE           = os.getenv("LOOSE_MODE", "0") == "1"           # 宽松模式（见 extract_code 说明）
 
-# 统一长度（与 OTP_MIN/OTP_MAX 一致）；允许中间空格/横杠
-CODE_RE = re.compile(r"(?<![A-Za-z0-9])(?:\d[ \t-]?){%d,%d}(?![A-Za-z0-9])" % (OTP_MIN, OTP_MAX))
+# 关键词（可用 NEAR_KEYS_EXTRA=英文,中文,passcode 追加）
+NEAR_KEYS_BASE = ["验证码","校验码","code","verify","verification","登录","安全","2FA","OTP",
+                  "PIN","passcode","your code","one-time password","magic code","提取码","口令",
+                  "auth","authentication code"]
+NEAR_KEYS_EXTRA = [s.strip() for s in os.getenv("NEAR_KEYS_EXTRA","").split(",") if s.strip()]
+NEAR_KEYS = NEAR_KEYS_BASE + NEAR_KEYS_EXTRA
 
-# ---- Telegram 会话：连接复用 + 自动重试 ----
-TG_SESSION = requests.Session()
-_adapter = HTTPAdapter(
-    pool_connections=4,
-    pool_maxsize=8,
-    max_retries=Retry(
-        total=TG_RETRIES,
-        backoff_factor=0.3,
-        status_forcelist=[500, 502, 503, 504],
-        allowed_methods=frozenset(["POST"])
-    )
-)
-TG_SESSION.mount("https://", _adapter)
-TG_SESSION.mount("http://", _adapter)
+# 文本间隔（大间隔：EM 空格 U+2003），复制时也保留空格
+EMSP = "\u2003"
+GAP = EMSP * 6
+# =======================================================================
+
+CODE_RE = re.compile(r"(?<!\d)(?:\d[\s-]?){%d,%d}(?!\d)" % (OTP_MIN, OTP_MAX))
 
 def dec(s):
     if not s: return ""
-    try: return str(make_header(decode_header(s)))
-    except Exception: return s
+    try:
+        return str(make_header(decode_header(s)))
+    except Exception:
+        return s or ""
 
 def body_text(msg):
+    """抽取 text/plain，退化到 text/html 转纯文本；失败返回空串"""
     if msg.is_multipart():
-        # 优先 text/plain
         for p in msg.walk():
             if p.get_content_type()=="text/plain" and "attachment" not in str(p.get("Content-Disposition") or ""):
                 try:
                     return p.get_payload(decode=True).decode(p.get_content_charset() or "utf-8","ignore")
                 except Exception:
                     pass
-        # 次选 text/html -> 纯文本
         for p in msg.walk():
             if p.get_content_type()=="text/html":
-                from html import unescape
+                from html import unescape; import re as _r
                 try:
                     h = p.get_payload(decode=True).decode(p.get_content_charset() or "utf-8","ignore")
+                    return _r.sub(r"\s+"," ", _r.sub(r"<[^>]+>"," ", unescape(h)))
                 except Exception:
-                    h = ""
-                h = re.sub(r"<(script|style)[\s\S]*?</\1>", " ", h, flags=re.I)
-                return re.sub(r"\s+"," ", re.sub(r"<[^>]+>"," ", unescape(h)))
+                    pass
     else:
-        try: return msg.get_payload(decode=True).decode(msg.get_content_charset() or "utf-8","ignore")
-        except Exception: return ""
+        try:
+            return msg.get_payload(decode=True).decode(msg.get_content_charset() or "utf-8","ignore")
+        except Exception:
+            return ""
     return ""
 
-def mail_time_str_full(msg):
+def mail_time_str(msg):
+    """把邮件 Date 转成本地时间字符串：MM-DD HH:MM（备用）"""
     try:
         raw = msg.get("Date")
         if raw:
@@ -93,34 +80,38 @@ def mail_time_str_full(msg):
             local_dt = dt.astimezone(datetime.now().astimezone().tzinfo)
         else:
             local_dt = datetime.now().astimezone()
-        return local_dt.strftime("%Y-%m-%d %H:%M:%S")
+        return local_dt.strftime("%m-%d %H:%M")
     except Exception:
-        return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        return datetime.now().astimezone().strftime("%m-%d %H:%M")
+
+def mail_time_str_ymd(msg):
+    """YYYY年MM月DD日 HH:MM（用于第一条 meta 消息）"""
+    try:
+        raw = msg.get("Date")
+        if raw:
+            dt = parsedate_to_datetime(raw)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.now().astimezone().tzinfo)
+            local_dt = dt.astimezone(datetime.now().astimezone().tzinfo)
+        else:
+            local_dt = datetime.now().astimezone()
+        return local_dt.strftime("%Y年%m月%d日 %H:%M")
+    except Exception:
+        return datetime.now().astimezone().strftime("%Y年%m月%d日 %H:%M")
 
 def send_tg(token, chat_id, text, proxy=None):
-    """ 发送 Telegram 文本消息；若遇 429，读取 retry_after 并等待重试一次。 """
+    """Telegram 推送"""
+    if not token or not chat_id or not text:
+        return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     proxies = {"http":proxy,"https":proxy} if proxy else None
     try:
-        r = TG_SESSION.post(
-            url,
-            data={"chat_id":chat_id,"text":text},
-            timeout=(TG_CONNECT_TIMEOUT, TG_READ_TIMEOUT),
-            proxies=proxies
-        )
-        if r.status_code == 429:
-            try:
-                ra = int(r.json().get("parameters", {}).get("retry_after", 1))
-            except Exception:
-                ra = 1
-            time.sleep(ra + 0.2)
-            TG_SESSION.post(url, data={"chat_id":chat_id,"text":text},
-                            timeout=(TG_CONNECT_TIMEOUT, TG_READ_TIMEOUT),
-                            proxies=proxies)
+        requests.post(url, data={"chat_id":chat_id,"text":text}, timeout=10, proxies=proxies)
     except Exception as e:
         print("Telegram 推送失败：", e)
 
 def connect_pop3(host, user, pwd, port_ssl=995, port_plain=110):
+    """优先 995/SSL；失败回落 110(+STLS)/明文"""
     try:
         ctx = ssl.create_default_context()
         srv = poplib.POP3_SSL(host, port_ssl, context=ctx, timeout=10)
@@ -138,6 +129,7 @@ def connect_pop3(host, user, pwd, port_ssl=995, port_plain=110):
         return srv
 
 def uidl_map(srv):
+    """返回 {序号: UIDL}；失败返回 {}"""
     try:
         resp, lst, _ = srv.uidl(); m={}
         for line in lst or []:
@@ -148,188 +140,193 @@ def uidl_map(srv):
         return {}
 
 def fetch_msg(srv, num):
+    """拉取一封并解析为 email.message.Message"""
     resp, lines, _ = srv.retr(num)
     raw = b"\r\n".join(lines)
     return email.message_from_bytes(raw)
 
-def _has_near_key(s: str) -> bool:
-    s = (s or "").lower()
-    return any(k.lower() in s for k in NEAR_KEYS)
+# ================ 验证码识别相关工具（URL/邮箱位置识别） =================
+_URL_RE   = re.compile(r'https?://[^\s<>"]+')
+_EMAIL_RE = re.compile(r'[\w\.-]+@[\w\.-]+\.\w+')
 
-def _in_url_or_email(hay: str, s: int, e: int) -> bool:
-    """更稳妥的 URL/邮箱附近过滤"""
-    before = hay[max(0, s-120):s]
-    after  = hay[e:e+120]
-    b = before.rstrip().lower()
-    a = after.lstrip().lower()
+def _overlaps(a_start, a_end, b_start, b_end):
+    return not (a_end <= b_start or b_end <= a_start)
 
-    # 邮箱地址中的数字
-    if b.endswith('@') or ('@' in b and not b.endswith(' ')): 
-        return True
-    if a.startswith('.') and re.match(r"\.[a-z]{2,10}\b", a): 
-        return True
+def _slice_window(text, s, e, extra=120):
+    lo = max(0, s - extra)
+    hi = min(len(text), e + extra)
+    return text[lo:hi], lo, hi
 
-    # URL 附近（考虑长 query/fragment）
-    near = hay[max(0, s-150):e+150].lower()
-    if "http://" in near or "https://" in near or "://" in near:
-        return True
-    # 典型 URL 连接符号
-    if re.search(r"[?&=#/_-]{0,30}$", b) or re.match(r"^[?&=#/_-]", a):
-        return True
+def _in_url_or_email(hay, s, e):
+    """判断 [s,e) 这段数字是否处在 URL/邮箱里（或紧邻）"""
+    win, base, _ = _slice_window(hay, s, e, extra=200)
+    for m in _URL_RE.finditer(win):
+        if _overlaps(s, e, base+m.start(), base+m.end()):
+            return True
+    for m in _EMAIL_RE.finditer(win):
+        if _overlaps(s, e, base+m.start(), base+m.end()):
+            return True
     return False
+# ======================================================================
+
+def _has_any_key(text):
+    low = (text or "").lower()
+    return any(k.lower() in low for k in NEAR_KEYS)
 
 def extract_code(text: str, subject: str = ""):
     """
-    仅在“附近窗口命中关键词”或“主题命中关键词”时返回验证码；
-    否则返回 None —— 避免营销邮件/长 URL 参数等误报。
+    识别策略（从严到松）：
+    1) 先在“近邻 WINDOW_NEAR 内命中关键词”的数字里选第一段；
+       默认会过滤 URL/邮箱里的数字，除非 ALLOW_CODE_IN_URL=1。
+    2) 若 1) 无果：若 LOOSE_MODE=1 或整封命中过任一关键词，
+       则宽松地抓“第一段数字”（仍受 ALLOW_CODE_IN_URL 控制）。
+    3) 否则返回 None。
     """
-    hay = ((subject or "") + "\n" + (text or ""))
+    subj = subject or ""
+    body = text or ""
+    hay  = subj + "\n" + body
+
+    # Step 1: 严格近邻
     candidates = []
-
     for m in CODE_RE.finditer(hay):
-        digits = re.sub(r"\D", "", m.group())
-        if not (OTP_MIN <= len(digits) <= OTP_MAX):
-            continue
-        s, e = m.span()
-        if _in_url_or_email(hay, s, e):
-            continue
+        s, e  = m.span()
+        lo    = max(0, s - WINDOW_NEAR)
+        hi    = min(len(hay), e + WINDOW_NEAR)
+        near  = hay[lo:hi].lower()
+        if any(k.lower() in near for k in NEAR_KEYS):
+            if not ALLOW_CODE_IN_URL and _in_url_or_email(hay, s, e):
+                continue
+            candidates.append(m.group())
 
-        win = hay[max(0, s - WINDOW_NEAR): min(len(hay), e + WINDOW_NEAR)]
-        near_hit = _has_near_key(win)
-        subj_hit = _has_near_key(subject)
+    if candidates:
+        return re.sub(r"[\s-]", "", candidates[0])
 
-        # 只有命中关键词才纳入候选
-        if near_hit or subj_hit:
-            # score: 0=附近命中，1=仅主题命中
-            score = 0 if near_hit else 1
-            candidates.append((score, s, digits))
+    # Step 2: 宽松回退
+    if LOOSE_MODE or _has_any_key(hay):
+        for m in CODE_RE.finditer(hay):
+            s, e = m.span()
+            if not ALLOW_CODE_IN_URL and _in_url_or_email(hay, s, e):
+                continue
+            return re.sub(r"[\s-]", "", m.group())
 
-    if not candidates:
-        return None
-
-    candidates.sort(key=lambda x: (x[0], x[1]))  # 附近命中优先；相同按出现顺序
-    return candidates[0][2]
+    return None
 
 def startup_flag_path(user):
-    import hashlib
+    """无 UIDL 时防重复：用账号生成唯一 flag 文件名"""
     key = hashlib.sha1(user.encode("utf-8")).hexdigest()[:12]
     return os.path.join(os.getcwd(), f".startup_done_{key}.flag")
 
-def sender_str(msg):
-    frm = msg.get("From") or ""
-    name, addr = parseaddr(frm)
-    name = dec(name)
-    if name and addr: return f"{name} <{addr}>"
-    return addr or name or "(未知发件人)"
-
-def send_time_and_code(token, chat, code, ts_full, sender, proxy=None):
-    prefix = f"📬 邮箱收到 | {ts_full} | 发件人：{sender}"
-    send_tg(token, chat, prefix, proxy)
-    time.sleep(PER_CHAT_GAP)
+def send_meta_then_code(token, chat, frm, to, ts, code, proxy=None):
+    """
+    发送两条：
+    1) 📬 时间 发件人 → 收件人
+    2) 纯验证码
+    """
+    line1 = f"📬 {ts}  {frm} → {to}"
+    send_tg(token, chat, line1, proxy)
     send_tg(token, chat, code, proxy)
 
 def run_session(host, user, pwd, token, chat, proxy, seen_uids):
-    srv = connect_pop3(host, user, pwd,
-                       int(os.getenv("POP3_PORT_SSL","995")),
-                       int(os.getenv("POP3_PORT_PLAIN","110")))
+    srv = connect_pop3(
+        host, user, pwd,
+        int(os.getenv("POP3_PORT_SSL","995")),
+        int(os.getenv("POP3_PORT_PLAIN","110"))
+    )
     total, _ = srv.stat()
 
-    # ---- 启动阶段：读取最近 N 封（去重）----
+    # ---------------- 启动阶段：最多读取最近 N 封，但要去重 ----------------
     m0 = uidl_map(srv)
     baseline_total = None
     if FETCH_STARTUP_LAST_N > 0 and total > 0:
         start = max(1, total - FETCH_STARTUP_LAST_N + 1)
         if m0:
+            # 有 UIDL：逐封检查是否已处理过
             for num in range(start, total+1):
                 uid = m0.get(num)
-                if not uid or uid in seen_uids: continue
+                if not uid or uid in seen_uids:
+                    continue
                 try:
-                    msg  = fetch_msg(srv, num)
-                    subj = dec(msg.get("Subject"))
-                    text = body_text(msg)
-                    code = extract_code(text or "", subj)
+                    msg   = fetch_msg(srv, num)
+                    subj  = dec(msg.get("Subject"))
+                    text  = body_text(msg)
+                    code  = extract_code(text, subj)
                     if code:
-                        tsf = mail_time_str_full(msg)
-                        sender = sender_str(msg)
-                        send_time_and_code(token, chat, code, tsf, sender, proxy)
-                        try: open("latest_code.txt","w",encoding="utf-8").write(code)
-                        except Exception: pass
-                    seen_uids.add(uid)
+                        ts   = mail_time_str_ymd(msg)
+                        frm  = dec(msg.get("From")) or "(unknown)"
+                        to   = dec(msg.get("To")) or user
+                        send_meta_then_code(token, chat, frm, to, ts, code, proxy)
+                        try:
+                            with open("latest_code.txt","w",encoding="utf-8") as f: f.write(code)
+                        except Exception:
+                            pass
+                    seen_uids.add(uid)  # 标记已处理
                 except Exception as e:
                     print("历史邮件处理失败：", e)
         else:
+            # 无 UIDL：仅在第一次运行时推；之后靠 flag 防重复
             flag = startup_flag_path(user)
             if not os.path.exists(flag):
                 for num in range(start, total+1):
                     try:
-                        msg  = fetch_msg(srv, num)
-                        subj = dec(msg.get("Subject"))
-                        text = body_text(msg)
-                        code = extract_code(text or "", subj)
+                        msg   = fetch_msg(srv, num)
+                        subj  = dec(msg.get("Subject"))
+                        text  = body_text(msg)
+                        code  = extract_code(text, subj)
                         if code:
-                            tsf = mail_time_str_full(msg)
-                            sender = sender_str(msg)
-                            send_time_and_code(token, chat, code, tsf, sender, proxy)
-                            try: open("latest_code.txt","w",encoding="utf-8").write(code)
-                            except Exception: pass
+                            ts   = mail_time_str_ymd(msg)
+                            frm  = dec(msg.get("From")) or "(unknown)"
+                            to   = dec(msg.get("To")) or user
+                            send_meta_then_code(token, chat, frm, to, ts, code, proxy)
+                            try:
+                                with open("latest_code.txt","w",encoding="utf-8") as f: f.write(code)
+                            except Exception:
+                                pass
                     except Exception as e:
                         print("历史邮件处理失败：", e)
-                try: open(flag, "w").write("done")
-                except Exception: pass
+                try:
+                    with open(flag, "w") as f: f.write("done")
+                except Exception:
+                    pass
             baseline_total = total
-    # --------------------------------------
+    # --------------------------------------------------------------------
 
+    # 启动后：把当前信箱内所有 UID 标为已见，避免后续 while 又把历史识别为新
     if m0:
         seen_uids.update(m0.values())
 
-    # ========== 轮询阶段：UIDL+STAT 双检测 ==========
+    # ======================= 轮询阶段（只处理新邮件） ======================
     t0 = time.time()
-    seen_nums = set()
-    last_stat_total = total
-
     while True:
         if time.time() - t0 >= RECONNECT_EVERY:
-            break
+            break  # 到点重连
         try:
-            m = uidl_map(srv)            # 1) UIDL
-            cur_total, _ = srv.stat()    # 2) STAT
-
-            new_by_uidl, new_by_stat = [], []
+            m = uidl_map(srv)
             if m:
-                for n,u in sorted(m.items()):
-                    if u not in seen_uids and n not in seen_nums:
-                        new_by_uidl.append(n)
-
-            if cur_total > (last_stat_total or 0):
-                for n in range((last_stat_total or 0)+1, cur_total+1):
-                    if n not in seen_nums:
-                        new_by_stat.append(n)
-            last_stat_total = cur_total
-
-            if not m:
+                new_nums = [n for n,u in sorted(m.items()) if u not in seen_uids]
+            else:
+                cur_total, _ = srv.stat()
                 if baseline_total is None:
                     baseline_total = cur_total
-                new_by_stat = [n for n in range(baseline_total+1, cur_total+1) if n not in seen_nums]
+                new_nums = list(range(baseline_total+1, cur_total+1))
                 baseline_total = cur_total
 
-            new_nums = sorted(set(new_by_uidl) | set(new_by_stat))[-20:]
-
-            for num in new_nums:
+            for num in new_nums[-20:]:
                 msg  = fetch_msg(srv, num)
                 subj = dec(msg.get("Subject"))
                 text = body_text(msg)
-                code = extract_code(text or "", subj)
+                code = extract_code(text, subj)
                 if code:
-                    tsf = mail_time_str_full(msg)
-                    sender = sender_str(msg)
-                    send_time_and_code(token, chat, code, tsf, sender, proxy)
-                    try: open("latest_code.txt","w",encoding="utf-8").write(code)
-                    except Exception: pass
+                    ts   = mail_time_str_ymd(msg)
+                    frm  = dec(msg.get("From")) or "(unknown)"
+                    to   = dec(msg.get("To")) or user
+                    send_meta_then_code(token, chat, frm, to, ts, code, proxy)
+                    try:
+                        with open("latest_code.txt","w",encoding="utf-8") as f: f.write(code)
+                    except Exception:
+                        pass
 
-                if m:
-                    uid = m.get(num)
-                    if uid: seen_uids.add(uid)
-                seen_nums.add(num)
+                uid = (m.get(num) if m else f"no-uidl-{num}")
+                seen_uids.add(uid)  # 标记已处理，防重复
 
             time.sleep(POLL_SECONDS)
 
@@ -337,17 +334,12 @@ def run_session(host, user, pwd, token, chat, proxy, seen_uids):
             print("[POP3] 会话异常，切换到重连…", e); break
         except Exception as e:
             print("错误：", e); time.sleep(POLL_SECONDS)
-    # ================================================
+    # =====================================================================
 
     try: srv.quit()
     except Exception: pass
 
 def main():
-    try:
-        from dotenv import load_dotenv; load_dotenv()
-    except Exception:
-        pass
-
     host  = os.getenv("POP3_HOST","pop3.2925.com").strip()
     user  = os.getenv("EMAIL_USER","")
     pwd   = os.getenv("EMAIL_PASS","")
@@ -355,12 +347,15 @@ def main():
     chat  = os.getenv("TELEGRAM_CHAT_ID","")
     proxy = os.getenv("TG_PROXY") or None
 
+    # 启动提示
     try:
-        send_tg(token, chat, "✅ POP3 验证码监听已启动。（更严格关键词判定；先发“时间+发件人”，再发“验证码”）", proxy)
+        send_tg(token, chat,
+                "✅ POP3 验证码监听已启动。（两条消息：先时间与往来，再纯验证码；开关：ALLOW_CODE_IN_URL / LOOSE_MODE）",
+                proxy)
     except Exception as e:
         print("❌ Telegram 失败：", e)
 
-    seen_uids = set()
+    seen_uids = set()  # 跨会话累积，防止重连后重复
     while True:
         try:
             run_session(host, user, pwd, token, chat, proxy, seen_uids)
@@ -372,3 +367,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

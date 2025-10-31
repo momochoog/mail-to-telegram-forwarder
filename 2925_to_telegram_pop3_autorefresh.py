@@ -38,20 +38,23 @@ def body_text(msg):
         except Exception: return ""
     return ""
 
-def mail_time_str(msg):
-    """把邮件 Date 转成本地时间字符串：MM-DD HH:MM"""
+# ---------- 时间：使用邮件原始时间，不做任何时区换算 ----------
+def mail_time_str_ymd(msg):
+    """
+    用邮件头里的原始时间（不进行任何时区转换），格式：YYYY年MM月DD日 HH:MM
+    - 优先取 Date 头；
+    - 解析失败或缺失时，退回当前本机时间（不做时区换算）。
+    """
     try:
         raw = msg.get("Date")
         if raw:
             dt = parsedate_to_datetime(raw)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=datetime.now().astimezone().tzinfo)
-            local_dt = dt.astimezone(datetime.now().astimezone().tzinfo)
+            return dt.strftime("%Y年%m月%d日 %H:%M")
         else:
-            local_dt = datetime.now().astimezone()
-        return local_dt.strftime("%m-%d %H:%M")
+            return datetime.now().strftime("%Y年%m月%d日 %H:%M")
     except Exception:
-        return datetime.now().astimezone().strftime("%m-%d %H:%M")
+        return datetime.now().strftime("%Y年%m月%d日 %H:%M")
+# ------------------------------------------------------------
 
 def send_tg(token, chat_id, text, proxy=None):
     url = "https://api.telegram.org/bot{}/sendMessage".format(token)
@@ -109,10 +112,12 @@ def startup_flag_path(user):
     key = hashlib.sha1(user.encode("utf-8")).hexdigest()[:12]
     return os.path.join(os.getcwd(), ".startup_done_{}.flag".format(key))
 
-def send_code_with_time(token, chat, code, ts, proxy=None):
-    # 一条消息，验证码 + 大间隔 + 时间
-    text = "{}{}🕒 {}".format(code, GAP, ts)
-    send_tg(token, chat, text, proxy)
+# ---------- 改成两条消息：第一条元信息，第二条纯验证码 ----------
+def send_meta_then_code(token, chat, frm, to, ts, code, proxy=None):
+    meta = f"📬 {ts}{GAP}{frm} → {to}"
+    send_tg(token, chat, meta, proxy)
+    send_tg(token, chat, code, proxy)
+# ------------------------------------------------------------
 
 def run_session(host, user, pwd, token, chat, proxy, seen_uids):
     srv = connect_pop3(host, user, pwd,
@@ -135,8 +140,10 @@ def run_session(host, user, pwd, token, chat, proxy, seen_uids):
                     text = body_text(msg)
                     code = extract_code(text or "")
                     if code:
-                        ts = mail_time_str(msg)
-                        send_code_with_time(token, chat, code, ts, proxy)
+                        ts  = mail_time_str_ymd(msg)
+                        frm = dec(msg.get("From")) or "(unknown)"
+                        to  = dec(msg.get("To")) or user
+                        send_meta_then_code(token, chat, frm, to, ts, code, proxy)
                         try:
                             with open("latest_code.txt","w",encoding="utf-8") as f: f.write(code)
                         except Exception:
@@ -154,8 +161,10 @@ def run_session(host, user, pwd, token, chat, proxy, seen_uids):
                         text = body_text(msg)
                         code = extract_code(text or "")
                         if code:
-                            ts = mail_time_str(msg)
-                            send_code_with_time(token, chat, code, ts, proxy)
+                            ts  = mail_time_str_ymd(msg)
+                            frm = dec(msg.get("From")) or "(unknown)"
+                            to  = dec(msg.get("To")) or user
+                            send_meta_then_code(token, chat, frm, to, ts, code, proxy)
                             try:
                                 with open("latest_code.txt","w",encoding="utf-8") as f: f.write(code)
                             except Exception:
@@ -196,8 +205,10 @@ def run_session(host, user, pwd, token, chat, proxy, seen_uids):
                 text = body_text(msg)
                 code = extract_code(text or "")
                 if code:
-                    ts = mail_time_str(msg)
-                    send_code_with_time(token, chat, code, ts, proxy)
+                    ts  = mail_time_str_ymd(msg)
+                    frm = dec(msg.get("From")) or "(unknown)"
+                    to  = dec(msg.get("To")) or user
+                    send_meta_then_code(token, chat, frm, to, ts, code, proxy)
                     try:
                         with open("latest_code.txt","w",encoding="utf-8") as f: f.write(code)
                     except Exception:
@@ -230,7 +241,7 @@ def main():
     chat  = os.getenv("TELEGRAM_CHAT_ID","")
     proxy = os.getenv("TG_PROXY") or None
 
-    # 静默提示（若不需要可去掉这行）
+    # 启动提示
     try: send_tg(token, chat, "✅ POP3 验证码监听已启动。（开机最多读 2 条历史）", proxy)
     except Exception as e: print("❌ Telegram 失败：", e)
 
@@ -246,4 +257,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

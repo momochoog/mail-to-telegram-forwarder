@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
+"""
+可用环境变量（都可不设，用默认值）：
+- TIME_SOURCE   : 'received' | 'date'       # 时间来源，默认 received（顶层 Received）
+- TIME_TZ       : 'Asia/Shanghai'           # 目标显示时区，默认北京时间
+- TIME_CONVERT  : '1' 或 '0'                # 是否把邮件头时间换算到目标时区，默认 1
+- TIME_FMT      : strftime 格式             # 默认 "%Y年%m月%d日 %H:%M"
+"""
+
 import os, re, time, ssl, poplib, email, requests, hashlib
 from email.header import decode_header, make_header
 from email.utils import parsedate_to_datetime
@@ -17,12 +26,24 @@ GAP = EMSP * 6             # 想再宽就调这个数字
 NEAR_KEYS = ["验证码","校验码","code","verify","verification","登录","安全","2FA","OTP"]
 CODE_RE = re.compile(r"(?<!\d)(?:\d[\s-]?){4,8}(?!\d)")
 
+# ---------- 时区/显示参数 ----------
+TIME_SOURCE  = os.getenv("TIME_SOURCE", "received").lower()   # 'received' or 'date'
+TIME_CONVERT = os.getenv("TIME_CONVERT", "1") == "1"
+TIME_FMT     = os.getenv("TIME_FMT", "%Y年%m月%d日 %H:%M")
+# 目标时区
+try:
+    from zoneinfo import ZoneInfo
+    TARGET_TZ = ZoneInfo(os.getenv("TIME_TZ", "Asia/Shanghai"))
+except Exception:
+    TARGET_TZ = timezone(timedelta(hours=8))  # 兜底：东八区
+# ----------------------------------
+
 def dec(s):
     if not s: return ""
     try:
         return str(make_header(decode_header(s)))
     except Exception:
-        return s
+        return s or ""
 
 def body_text(msg):
     if msg.is_multipart():
@@ -35,8 +56,11 @@ def body_text(msg):
         for p in msg.walk():
             if p.get_content_type()=="text/html":
                 from html import unescape; import re as _r
-                h = p.get_payload(decode=True).decode(p.get_content_charset() or "utf-8","ignore")
-                return _r.sub(r"\s+"," ", _r.sub(r"<[^>]+>"," ", unescape(h)))
+                try:
+                    h = p.get_payload(decode=True).decode(p.get_content_charset() or "utf-8","ignore")
+                    return _r.sub(r"\s+"," ", _r.sub(r"<[^>]+>"," ", unescape(h)))
+                except Exception:
+                    pass
     else:
         try:
             return msg.get_payload(decode=True).decode(msg.get_content_charset() or "utf-8","ignore")
@@ -44,45 +68,63 @@ def body_text(msg):
             return ""
     return ""
 
-# ---------- 时间：优先 Received，再 Date；不做换算；无时区按北京时间 ----------
-_BJ = timezone(timedelta(hours=8))
-
-def mail_time_str_ymd(msg):
-    """
-    返回“邮件原始时间”（不做任何时区换算），格式：YYYY年MM月DD日 HH:MM
-    1) 优先取顶层 Received 的分号后的时间；
-    2) 其次取 Date；
-    3) 若时间无时区，则按北京时间处理；仍失败则用当前北京时间。
-    """
+# ------------------- 时间：优先顶层 Received（收件服务器），否则 Date -------------------
+def _parse_received_dt(msg):
+    """返回顶层 Received 分号后的时间（datetime），解析失败返回 None"""
     try:
         recvs = msg.get_all('Received') or []
-        for r in recvs:  # 顶层在前 → 越靠前越新
+        for r in recvs:  # 顶层在前，越靠前越新（更接近“邮箱收到时间”）
             tstr = r.rsplit(';', 1)[-1].strip() if ';' in r else r.strip()
             try:
-                dt = parsedate_to_datetime(tstr)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=_BJ)
-                return dt.strftime("%Y年%m月%d日 %H:%M")
+                return parsedate_to_datetime(tstr)
             except Exception:
                 continue
     except Exception:
         pass
+    return None
 
+def _parse_date_dt(msg):
     try:
         raw = msg.get("Date")
         if raw:
-            dt = parsedate_to_datetime(raw)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=_BJ)
-            return dt.strftime("%Y年%m月%d日 %H:%M")
+            return parsedate_to_datetime(raw)
     except Exception:
         pass
+    return None
 
-    return datetime.now(_BJ).strftime("%Y年%m月%d日 %H:%M")
-# ------------------------------------------------------------
+def _to_target_tz(dt):
+    """按配置换算到目标时区；若无 tz 且需要换算，则视为目标时区"""
+    if not isinstance(dt, datetime):
+        return None
+    if TIME_CONVERT:
+        # 需要换算：无 tz 直接视作目标时区，有 tz 则 astimezone
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=TARGET_TZ)
+        return dt.astimezone(TARGET_TZ)
+    else:
+        # 不换算：无 tz 时也不补 tz，原样返回
+        return dt
+
+def mail_time_str_ymd(msg):
+    """
+    返回“邮箱收到时间”（优先顶层 Received），并按配置换算到目标时区；
+    格式由 TIME_FMT 控制，默认：YYYY年MM月DD日 HH:MM（北京时间）。
+    """
+    dt = None
+    if TIME_SOURCE == "received":
+        dt = _parse_received_dt(msg) or _parse_date_dt(msg)
+    else:
+        dt = _parse_date_dt(msg) or _parse_received_dt(msg)
+
+    if dt is None:
+        dt = datetime.now(TARGET_TZ) if TIME_CONVERT else datetime.now()
+
+    dt2 = _to_target_tz(dt) or dt
+    return dt2.strftime(TIME_FMT)
+# ------------------------------------------------------------------------------------
 
 def send_tg(token, chat_id, text, proxy=None):
-    url = "https://api.telegram.org/bot{}/sendMessage".format(token)
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
     proxies = {"http":proxy,"https":proxy} if proxy else None
     try:
         requests.post(url, data={"chat_id":chat_id,"text":text}, timeout=10, proxies=proxies)
@@ -135,7 +177,7 @@ def extract_code(text):
 def startup_flag_path(user):
     """无 UIDL 时防重复：用账号生成唯一 flag 文件名"""
     key = hashlib.sha1(user.encode("utf-8")).hexdigest()[:12]
-    return os.path.join(os.getcwd(), ".startup_done_{}.flag".format(key))
+    return os.path.join(os.getcwd(), f".startup_done_{key}.flag")
 
 # ---------- 两条消息：第一条元信息，第二条纯验证码 ----------
 def send_meta_then_code(token, chat, frm, to, ts, code, proxy=None):
@@ -169,8 +211,7 @@ def run_session(host, user, pwd, token, chat, proxy, seen_uids):
                         to  = dec(msg.get("To")) or user
                         send_meta_then_code(token, chat, frm, to, ts, code, proxy)
                         try:
-                            with open("latest_code.txt","w",encoding="utf-8") as f:
-                                f.write(code)
+                            with open("latest_code.txt","w",encoding="utf-8") as f: f.write(code)
                         except Exception:
                             pass
                     seen_uids.add(uid)
@@ -190,21 +231,18 @@ def run_session(host, user, pwd, token, chat, proxy, seen_uids):
                             to  = dec(msg.get("To")) or user
                             send_meta_then_code(token, chat, frm, to, ts, code, proxy)
                             try:
-                                with open("latest_code.txt","w",encoding="utf-8") as f:
-                                    f.write(code)
+                                with open("latest_code.txt","w",encoding="utf-8") as f: f.write(code)
                             except Exception:
                                 pass
                     except Exception as e:
                         print("历史邮件处理失败：", e)
                 try:
-                    with open(flag, "w") as f:
-                        f.write("done")
+                    with open(flag, "w") as f: f.write("done")
                 except Exception:
                     pass
             baseline_total = total
     # --------------------------------------------------------------------
 
-    # 启动后：把当前信箱内所有 UID 标为已见
     if m0:
         seen_uids.update(m0.values())
 
@@ -234,12 +272,11 @@ def run_session(host, user, pwd, token, chat, proxy, seen_uids):
                     to  = dec(msg.get("To")) or user
                     send_meta_then_code(token, chat, frm, to, ts, code, proxy)
                     try:
-                        with open("latest_code.txt","w",encoding="utf-8") as f:
-                            f.write(code)
+                        with open("latest_code.txt","w",encoding="utf-8") as f: f.write(code)
                     except Exception:
                         pass
 
-                uid = (m.get(num) if m else "no-uidl-{}".format(num))
+                uid = (m.get(num) if m else f"no-uidl-{num}")
                 seen_uids.add(uid)
 
             time.sleep(POLL_SECONDS)
@@ -250,8 +287,7 @@ def run_session(host, user, pwd, token, chat, proxy, seen_uids):
             print("错误：", e); time.sleep(POLL_SECONDS)
     # =====================================================================
 
-    try:
-        srv.quit()
+    try: srv.quit()
     except Exception:
         pass
 

@@ -33,6 +33,6 @@ TELEGRAM_CHAT_ID=83.....
 ## 说明
 - 这是一个 **后台 Worker** 程序，不暴露端口；Railway 上必须设置成 Background Worker。
 - 若报 429，脚本内置了 retry_after 处理，会自动缓解。
-- 启动时最多读取最近 2 封验证码（避免刷历史），之后 1 秒轮询收取新邮件。
+- 启动时最多读取最近 2 封验证码（避免刷历史），之后默认每 2 秒轮询收取新邮件（可通过 `POLL_SECONDS` 调整）。
 - 可在脚本顶部修改：轮询间隔 `POLL_SECONDS`、启动历史 `FETCH_STARTUP_LAST_N` 等。
 - 长期 24×7 运行建议使用 Railway 付费计划，避免试用到期/休眠。

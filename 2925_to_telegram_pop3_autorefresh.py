@@ -144,13 +144,43 @@ def mail_time_str_ymd(msg):
     return dt2.strftime(TIME_FMT)
 
 # —— Telegram 发送
-def send_tg(token, chat_id, text, proxy=None):
+def send_tg(token, chat_id, text, proxy=None, max_attempts=3):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     proxies = {"http":proxy,"https":proxy} if proxy else None
-    try:
-        requests.post(url, data={"chat_id":chat_id,"text":text}, timeout=10, proxies=proxies)
-    except Exception as e:
-        print("Telegram 推送失败：", e)
+    sleep = 1
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = requests.post(
+                url,
+                data={"chat_id": chat_id, "text": text},
+                timeout=10,
+                proxies=proxies,
+            )
+            if resp.ok:
+                return True
+
+            msg = f"Telegram 返回 {resp.status_code}: {resp.text}"
+            retry_after = None
+            if resp.status_code == 429:
+                try:
+                    retry_after = resp.json().get("parameters", {}).get("retry_after")
+                except Exception:
+                    retry_after = None
+            wait = retry_after if isinstance(retry_after, (int, float)) else sleep
+            if attempt == max_attempts:
+                print("Telegram 推送失败：", msg)
+                break
+            print(f"Telegram 推送失败（第 {attempt} 次）：{msg}，{wait} 秒后重试…")
+            time.sleep(max(1, wait))
+            sleep = min(sleep * 2, 30)
+        except requests.RequestException as e:
+            if attempt == max_attempts:
+                print("Telegram 推送失败：", e)
+                break
+            print(f"Telegram 推送异常（第 {attempt} 次）：{e}，{sleep} 秒后重试…")
+            time.sleep(sleep)
+            sleep = min(sleep * 2, 30)
+    return False
 
 # —— POP3 连接
 def connect_pop3(host, user, pwd, port_ssl=995, port_plain=110):
@@ -218,12 +248,31 @@ def extract_code(body_text_str: str, subject: str = "", from_str: str = "") -> s
         # 必须命中正向关键词；账单类数字被负面词命中时直接忽略
         if not has_pos:
             continue
-        if has_neg and not has_pos:
+        if has_neg:
             continue
 
         return re.sub(r"[\s-]", "", m.group())
 
     return None
+
+
+def process_single_message(msg, user, token, chat, proxy):
+    subj = dec(msg.get("Subject"))
+    frm = dec(msg.get("From") or "")
+    to = dec(msg.get("To") or user)
+    text = body_text(msg)
+    code = extract_code(text, subj, frm)
+    if not code:
+        return False
+
+    ts = mail_time_str_ymd(msg)
+    send_meta_then_code(token, chat, frm, to, ts, code, proxy)
+    try:
+        with open("latest_code.txt", "w", encoding="utf-8") as f:
+            f.write(code)
+    except Exception:
+        pass
+    return True
 
 # —— 启动去重 Flag（无 UIDL 时）
 def startup_flag_path(user):
@@ -233,7 +282,8 @@ def startup_flag_path(user):
 # —— 两条消息：第一条元信息，第二条纯验证码
 def send_meta_then_code(token, chat, frm, to, ts, code, proxy=None):
     meta = f"📬 {ts}{GAP}{frm} → {to}"
-    send_tg(token, chat, meta, proxy)
+    if not send_tg(token, chat, meta, proxy):
+        print("Telegram 元信息发送失败，仍尝试推送验证码。")
     send_tg(token, chat, code, proxy)
 
 # ====== 主循环 ======
@@ -254,19 +304,8 @@ def run_session(host, user, pwd, token, chat, proxy, seen_uids):
                 uid = m0.get(num)
                 if not uid or uid in seen_uids: continue
                 try:
-                    msg  = fetch_msg(srv, num)
-                    subj = dec(msg.get("Subject"))
-                    frm  = dec(msg.get("From") or "")
-                    to   = dec(msg.get("To") or user)
-                    text = body_text(msg)
-                    code = extract_code(text, subj, frm)
-                    if code:
-                        ts = mail_time_str_ymd(msg)
-                        send_meta_then_code(token, chat, frm, to, ts, code, proxy)
-                        try:
-                            with open("latest_code.txt","w",encoding="utf-8") as f: f.write(code)
-                        except Exception:
-                            pass
+                    msg = fetch_msg(srv, num)
+                    process_single_message(msg, user, token, chat, proxy)
                     seen_uids.add(uid)
                 except Exception as e:
                     print("历史邮件处理失败：", e)
@@ -275,19 +314,8 @@ def run_session(host, user, pwd, token, chat, proxy, seen_uids):
             if not os.path.exists(flag):
                 for num in range(start, total+1):
                     try:
-                        msg  = fetch_msg(srv, num)
-                        subj = dec(msg.get("Subject"))
-                        frm  = dec(msg.get("From") or "")
-                        to   = dec(msg.get("To") or user)
-                        text = body_text(msg)
-                        code = extract_code(text, subj, frm)
-                        if code:
-                            ts = mail_time_str_ymd(msg)
-                            send_meta_then_code(token, chat, frm, to, ts, code, proxy)
-                            try:
-                                with open("latest_code.txt","w",encoding="utf-8") as f: f.write(code)
-                            except Exception:
-                                pass
+                        msg = fetch_msg(srv, num)
+                        process_single_message(msg, user, token, chat, proxy)
                     except Exception as e:
                         print("历史邮件处理失败：", e)
                 try:
@@ -315,19 +343,8 @@ def run_session(host, user, pwd, token, chat, proxy, seen_uids):
                 baseline_total = cur_total
 
             for num in new_nums[-20:]:
-                msg  = fetch_msg(srv, num)
-                subj = dec(msg.get("Subject"))
-                frm  = dec(msg.get("From") or "")
-                to   = dec(msg.get("To") or user)
-                text = body_text(msg)
-                code = extract_code(text, subj, frm)
-                if code:
-                    ts = mail_time_str_ymd(msg)
-                    send_meta_then_code(token, chat, frm, to, ts, code, proxy)
-                    try:
-                        with open("latest_code.txt","w",encoding="utf-8") as f: f.write(code)
-                    except Exception:
-                        pass
+                msg = fetch_msg(srv, num)
+                process_single_message(msg, user, token, chat, proxy)
                 uid = (m.get(num) if m else f"no-uidl-{num}")
                 seen_uids.add(uid)
 

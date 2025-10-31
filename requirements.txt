@@ -1,3 +1,2 @@
-imapclient
-python-dotenv
 requests
+python-dotenv

@@ -3,7 +3,7 @@
 import os, re, time, ssl, poplib, email, requests, hashlib
 from email.header import decode_header, make_header
 from email.utils import parsedate_to_datetime
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 # ====== 可调参数 ======
 FETCH_STARTUP_LAST_N = 2   # 启动时最多读取 2 条历史验证码（仅一次）
@@ -19,41 +19,66 @@ CODE_RE = re.compile(r"(?<!\d)(?:\d[\s-]?){4,8}(?!\d)")
 
 def dec(s):
     if not s: return ""
-    try: return str(make_header(decode_header(s)))
-    except Exception: return s
+    try:
+        return str(make_header(decode_header(s)))
+    except Exception:
+        return s
 
 def body_text(msg):
     if msg.is_multipart():
         for p in msg.walk():
             if p.get_content_type()=="text/plain" and "attachment" not in str(p.get("Content-Disposition") or ""):
-                try: return p.get_payload(decode=True).decode(p.get_content_charset() or "utf-8","ignore")
-                except Exception: pass
+                try:
+                    return p.get_payload(decode=True).decode(p.get_content_charset() or "utf-8","ignore")
+                except Exception:
+                    pass
         for p in msg.walk():
             if p.get_content_type()=="text/html":
                 from html import unescape; import re as _r
                 h = p.get_payload(decode=True).decode(p.get_content_charset() or "utf-8","ignore")
                 return _r.sub(r"\s+"," ", _r.sub(r"<[^>]+>"," ", unescape(h)))
     else:
-        try: return msg.get_payload(decode=True).decode(msg.get_content_charset() or "utf-8","ignore")
-        except Exception: return ""
+        try:
+            return msg.get_payload(decode=True).decode(msg.get_content_charset() or "utf-8","ignore")
+        except Exception:
+            return ""
     return ""
 
-# ---------- 时间：使用邮件原始时间，不做任何时区换算 ----------
+# ---------- 时间：优先 Received，再 Date；不做换算；无时区按北京时间 ----------
+_BJ = timezone(timedelta(hours=8))
+
 def mail_time_str_ymd(msg):
     """
-    用邮件头里的原始时间（不进行任何时区转换），格式：YYYY年MM月DD日 HH:MM
-    - 优先取 Date 头；
-    - 解析失败或缺失时，退回当前本机时间（不做时区换算）。
+    返回“邮件原始时间”（不做任何时区换算），格式：YYYY年MM月DD日 HH:MM
+    1) 优先取顶层 Received 的分号后的时间；
+    2) 其次取 Date；
+    3) 若时间无时区，则按北京时间处理；仍失败则用当前北京时间。
     """
+    try:
+        recvs = msg.get_all('Received') or []
+        for r in recvs:  # 顶层在前 → 越靠前越新
+            tstr = r.rsplit(';', 1)[-1].strip() if ';' in r else r.strip()
+            try:
+                dt = parsedate_to_datetime(tstr)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=_BJ)
+                return dt.strftime("%Y年%m月%d日 %H:%M")
+            except Exception:
+                continue
+    except Exception:
+        pass
+
     try:
         raw = msg.get("Date")
         if raw:
             dt = parsedate_to_datetime(raw)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=_BJ)
             return dt.strftime("%Y年%m月%d日 %H:%M")
-        else:
-            return datetime.now().strftime("%Y年%m月%d日 %H:%M")
     except Exception:
-        return datetime.now().strftime("%Y年%m月%d日 %H:%M")
+        pass
+
+    return datetime.now(_BJ).strftime("%Y年%m月%d日 %H:%M")
 # ------------------------------------------------------------
 
 def send_tg(token, chat_id, text, proxy=None):
@@ -112,7 +137,7 @@ def startup_flag_path(user):
     key = hashlib.sha1(user.encode("utf-8")).hexdigest()[:12]
     return os.path.join(os.getcwd(), ".startup_done_{}.flag".format(key))
 
-# ---------- 改成两条消息：第一条元信息，第二条纯验证码 ----------
+# ---------- 两条消息：第一条元信息，第二条纯验证码 ----------
 def send_meta_then_code(token, chat, frm, to, ts, code, proxy=None):
     meta = f"📬 {ts}{GAP}{frm} → {to}"
     send_tg(token, chat, meta, proxy)
@@ -130,7 +155,6 @@ def run_session(host, user, pwd, token, chat, proxy, seen_uids):
     if FETCH_STARTUP_LAST_N > 0 and total > 0:
         start = max(1, total - FETCH_STARTUP_LAST_N + 1)
         if m0:
-            # 有 UIDL：逐封检查是否已处理过
             for num in range(start, total+1):
                 uid = m0.get(num)
                 if not uid or uid in seen_uids:
@@ -145,14 +169,14 @@ def run_session(host, user, pwd, token, chat, proxy, seen_uids):
                         to  = dec(msg.get("To")) or user
                         send_meta_then_code(token, chat, frm, to, ts, code, proxy)
                         try:
-                            with open("latest_code.txt","w",encoding="utf-8") as f: f.write(code)
+                            with open("latest_code.txt","w",encoding="utf-8") as f:
+                                f.write(code)
                         except Exception:
                             pass
-                    seen_uids.add(uid)  # 标记已处理
+                    seen_uids.add(uid)
                 except Exception as e:
                     print("历史邮件处理失败：", e)
         else:
-            # 无 UIDL：仅在第一次运行时推；之后靠 flag 防重复
             flag = startup_flag_path(user)
             if not os.path.exists(flag):
                 for num in range(start, total+1):
@@ -166,21 +190,21 @@ def run_session(host, user, pwd, token, chat, proxy, seen_uids):
                             to  = dec(msg.get("To")) or user
                             send_meta_then_code(token, chat, frm, to, ts, code, proxy)
                             try:
-                                with open("latest_code.txt","w",encoding="utf-8") as f: f.write(code)
+                                with open("latest_code.txt","w",encoding="utf-8") as f:
+                                    f.write(code)
                             except Exception:
                                 pass
                     except Exception as e:
                         print("历史邮件处理失败：", e)
-                # 写入 flag，后续重连不再重复推历史
                 try:
-                    with open(flag, "w") as f: f.write("done")
+                    with open(flag, "w") as f:
+                        f.write("done")
                 except Exception:
                     pass
-            # 无 UIDL：以当前总数为基线
             baseline_total = total
     # --------------------------------------------------------------------
 
-    # 启动后：把当前信箱内所有 UID 标为已见，避免后续 while 又把历史识别为新
+    # 启动后：把当前信箱内所有 UID 标为已见
     if m0:
         seen_uids.update(m0.values())
 
@@ -188,7 +212,7 @@ def run_session(host, user, pwd, token, chat, proxy, seen_uids):
     t0 = time.time()
     while True:
         if time.time() - t0 >= RECONNECT_EVERY:
-            break  # 到点重连
+            break
         try:
             m = uidl_map(srv)
             if m:
@@ -210,12 +234,13 @@ def run_session(host, user, pwd, token, chat, proxy, seen_uids):
                     to  = dec(msg.get("To")) or user
                     send_meta_then_code(token, chat, frm, to, ts, code, proxy)
                     try:
-                        with open("latest_code.txt","w",encoding="utf-8") as f: f.write(code)
+                        with open("latest_code.txt","w",encoding="utf-8") as f:
+                            f.write(code)
                     except Exception:
                         pass
 
                 uid = (m.get(num) if m else "no-uidl-{}".format(num))
-                seen_uids.add(uid)  # 标记已处理，防重复
+                seen_uids.add(uid)
 
             time.sleep(POLL_SECONDS)
 
@@ -225,8 +250,10 @@ def run_session(host, user, pwd, token, chat, proxy, seen_uids):
             print("错误：", e); time.sleep(POLL_SECONDS)
     # =====================================================================
 
-    try: srv.quit()
-    except Exception: pass
+    try:
+        srv.quit()
+    except Exception:
+        pass
 
 def main():
     # 读 .env
@@ -242,10 +269,12 @@ def main():
     proxy = os.getenv("TG_PROXY") or None
 
     # 启动提示
-    try: send_tg(token, chat, "✅ POP3 验证码监听已启动。（开机最多读 2 条历史）", proxy)
-    except Exception as e: print("❌ Telegram 失败：", e)
+    try:
+        send_tg(token, chat, "✅ POP3 验证码监听已启动。（开机最多读 2 条历史）", proxy)
+    except Exception as e:
+        print("❌ Telegram 失败：", e)
 
-    seen_uids = set()  # 跨会话累积，防止重连后重复
+    seen_uids = set()
     while True:
         try:
             run_session(host, user, pwd, token, chat, proxy, seen_uids)
@@ -257,3 +286,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
